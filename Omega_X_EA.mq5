@@ -24,6 +24,10 @@
 //|   6. Re-arm delay (StraddleRearmDelayBars) is applied after a     |
 //|      basket close, after pending expiry and after stray-pending   |
 //|      cleanup, to avoid re-arm churn inside the same bar.          |
+//|   7. Server-side basket TP (UseServerSideBasketTP) mirrors the code-driven
+//|      money target onto every open order at a safety-factor-multiplied price.
+//|      Purpose: if the EA stops running, the broker still closes the basket.
+//|      It is deliberately NOT cleaned up on deinit. Disabled on dirty grids.
 //+------------------------------------------------------------------+
 #property copyright "Omega X"
 #property link      ""
@@ -108,6 +112,8 @@ input bool           UseTPDecay         = false;    // shrink TP with depth
 input double         TPDecayFactor      = 0.95;     // applied as factor^(levels-1)
 input bool           UsePartialClose    = false;    // close oldest profitable trade at X% of target
 input double         PartialCloseRatio  = 0.8;      // 0..1
+input bool           UseServerSideBasketTP = true;   // Place computed TP on all basket orders (crash safety net)
+input double         BasketTPSafetyFactor  = 1.10;   // Server TP is this multiple of the code target (>= 1.0)
 
 input group "=== Safety Layer ==="
 input double         MaxTotalLots       = 5.0;      // hard cap on summed grid lots
@@ -353,6 +359,8 @@ bool ValidateInputs()
       return FailInit("TPDecayFactor must be > 0 when UseTPDecay is enabled.");
    if(UsePartialClose && (PartialCloseRatio <= 0.0 || PartialCloseRatio > 1.0))
       return FailInit("PartialCloseRatio must be within (0,1] when UsePartialClose is enabled.");
+   if(UseServerSideBasketTP && !(BasketTPSafetyFactor >= 1.0))
+      return FailInit("BasketTPSafetyFactor must be >= 1.0 when UseServerSideBasketTP is enabled.");
 
    if(StraddleRangeMode == RANGE_CANDLES && RangeLookbackCandles < MIN_LOOKBACK_BARS)
       return FailInit("RangeLookbackCandles must be >= 1 in RANGE_CANDLES mode.");
@@ -1114,6 +1122,136 @@ int OldestProfitableIndex()
    return -1;
   }
 
+//--- ComputeBasketTPPrice : converts the code-driven basket money target into a
+//--- server-side TP price anchored on the volume-weighted average entry.
+//--- outPrice : receives the normalized TP price (0.0 on failure).
+//--- Returns: false when no single price can express the basket (empty/dirty/mixed
+//--- side grid), when the tick value conversion is unusable, when the derived price
+//--- is non-positive, or when the broker stop/freeze distance would reject the TP.
+//--- The TP is NEVER moved closer to the market to satisfy the stop-level guard:
+//--- returning false lets the next tick retry instead of weakening the safety net.
+bool ComputeBasketTPPrice(double &outPrice)
+  {
+   outPrice = 0.0;
+   int count = ArraySize(g_grid);
+   if(count <= 0)
+      return false;
+   if(g_gridDirty)
+      return false;
+
+   ENUM_POSITION_TYPE side = g_grid[0].side;
+   double totalLots = 0.0;
+   double weightedSum = 0.0;
+   for(int i = 0; i < count; i++)
+     {
+      if(g_grid[i].side != side)
+         return false;                 // mixed sides: no single price hits the money target
+      totalLots += g_grid[i].lots;
+      weightedSum += g_grid[i].price * g_grid[i].lots;
+     }
+   if(!(totalLots > 0.0))
+      return false;
+
+   double target = totalLots * MoneyPerLotTP;
+   if(UseTPDecay)
+      target *= MathPow(TPDecayFactor, (double)count - 1.0);
+   target *= BasketTPSafetyFactor;      // strictly behind the code-driven exit
+   if(!(target > 0.0))
+      return false;
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickValue <= 0.0 || tickSize <= 0.0)
+      return false;
+   double moneyPerPointPerLot = (tickValue / tickSize) * _Point;
+   if(!(moneyPerPointPerLot > 0.0))
+      return false;
+
+   double avgEntry = weightedSum / totalLots;
+   // target / (lots * moneyPerPointPerLot) is expressed in POINTS; convert to price units.
+   double priceDistance = target / (totalLots * moneyPerPointPerLot) * _Point;
+   double tp = (side == POSITION_TYPE_BUY) ? (avgEntry + priceDistance)
+                                           : (avgEntry - priceDistance);
+   tp = NormalizeDouble(tp, _Digits);
+   if(!(tp > 0.0))
+      return false;
+
+   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minDist = (double)MathMax(stopsLevel, freezeLevel) * _Point;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(side == POSITION_TYPE_BUY  && (tp - bid) < minDist)
+      return false;
+   if(side == POSITION_TYPE_SELL && (ask - tp) < minDist)
+      return false;
+
+   outPrice = tp;
+   return true;
+  }
+
+//--- ApplyBasketTP : mirrors the computed server-side TP onto every basket order.
+//--- Existing SLs are preserved (always 0.0 in this EA, but never rewritten blindly).
+//--- Idempotent: orders whose TP is already within half a point are left untouched,
+//--- so a no-op tick issues no modify calls. Failures are logged, not retried here.
+//--- Returns: number of orders whose TP is correct afterwards (modified or matching).
+int ApplyBasketTP()
+  {
+   double tp = 0.0;
+   if(!ComputeBasketTPPrice(tp))
+      return 0;
+
+   int count = ArraySize(g_grid);
+   int correct = 0;
+   int modified = 0;
+   for(int i = 0; i < count; i++)
+     {
+      ulong ticket = g_grid[i].ticket;
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      double currentTP = PositionGetDouble(POSITION_TP);
+      if(MathAbs(currentTP - tp) <= 0.5 * _Point)
+        {
+         correct++;
+         continue;
+        }
+      double currentSL = PositionGetDouble(POSITION_SL);
+      if(g_trade.PositionModify(ticket, currentSL, tp) && IsOkRetcode(g_trade.ResultRetcode()))
+        {
+         correct++;
+         modified++;
+        }
+      else
+         LogInfo(StringFormat("[GM] Server-side TP modify failed for %s (retcode=%u %s).",
+                              TicketStr(ticket), g_trade.ResultRetcode(), g_trade.ResultRetcodeDescription()));
+     }
+   if(modified > 0)
+      LogInfo(StringFormat("[GM] Server-side basket TP %s applied to %d order(s).", PriceStr(tp), modified));
+   return correct;
+  }
+
+//--- ClearBasketTP : strips server-side TPs from the basket (best effort, silent failures).
+//--- Used when the grid turns dirty or a partial close changed the basket composition,
+//--- so stale single prices can never fire on a basket that has no such break-even.
+//--- Returns: number of orders whose TP was cleared.
+int ClearBasketTP()
+  {
+   int cleared = 0;
+   int count = ArraySize(g_grid);
+   for(int i = 0; i < count; i++)
+     {
+      ulong ticket = g_grid[i].ticket;
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetDouble(POSITION_TP) == 0.0)
+         continue;
+      double currentSL = PositionGetDouble(POSITION_SL);
+      if(g_trade.PositionModify(ticket, currentSL, 0.0) && IsOkRetcode(g_trade.ResultRetcode()))
+         cleared++;
+     }
+   return cleared;
+  }
+
 //--- ManageExits : dynamic basket TP and optional partial close.
 //--- NOTE: floating PL = POSITION_PROFIT + POSITION_SWAP. Commission is deliberately
 //--- excluded (most brokers report it separately); adjust MoneyPerLotTP if needed.
@@ -1154,6 +1292,11 @@ void ManageExits()
          if(ClosePositionTicket(ticket))
            {
             g_lastCloseBar = CurrentBarTime();
+            if(UseServerSideBasketTP)
+              {
+               RebuildGrid();       // remaining orders must mirror the NEW basket composition
+               ApplyBasketTP();
+              }
             return;               // basket continues with the remaining levels
            }
         }
@@ -1173,6 +1316,15 @@ void ManageExits()
 void ManageInGrid()
   {
    CancelAllPending();          // safety: no straddle leg may survive a fill
+
+   if(UseServerSideBasketTP)
+     {
+      if(g_gridDirty)
+         ClearBasketTP();
+      else
+         ApplyBasketTP();
+     }
+
    ManageGridAdds();
    ManageExits();
   }
