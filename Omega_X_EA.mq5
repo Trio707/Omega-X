@@ -38,6 +38,11 @@
 //|      daily-loss halt can close it. WarnDirtyGridExitless() therefore logs |
 //|      this through LogError (once per bar, independent of VerboseLog) so a |
 //|      hedged or gap-through basket can never sit unnoticed.                |
+//|   9. Lot normalization has a LotRoundingMode toggle:                     |
+//|        LOT_ROUND_FLOOR   -> MathFloor to broker step (default, preserves caps).
+//|        LOT_ROUND_NEAREST -> MathRound to broker step, with the cap re-floored
+//|                             to the step so the result stays a legal volume.
+//|      Only the body of NormalizeLot changes; callers are unaffected.       |
 //+------------------------------------------------------------------+
 #property copyright "Omega X"
 #property link      ""
@@ -67,6 +72,12 @@ enum ENUM_STRADDLE_STATE
    STATE_IDLE,               // flat, nothing armed
    STATE_ARMED,              // both straddle pendings alive, flat
    STATE_IN_GRID             // one or more positions with magic 892174 open
+  };
+
+enum ENUM_LOT_ROUNDING
+  {
+   LOT_ROUND_FLOOR,          // round DOWN to step (conservative, protects MaxTotalLots)
+   LOT_ROUND_NEAREST         // round to NEAREST step (matches the multiplier ladder)
   };
 
 //+------------------------------------------------------------------+
@@ -115,6 +126,7 @@ input double         BaseLot            = 0.01;     // level 1 volume
 input double         LotMultiplier      = 1.5;      // lot_n = BaseLot * LotMultiplier^(n-1)
 input double         MaxLotSize         = 10.0;     // hard cap per order
 input int            MaxGridLevels      = 10;       // hard cap on open trades in one grid
+input ENUM_LOT_ROUNDING LotRoundingMode = LOT_ROUND_FLOOR;  // step rounding: floor or nearest
 
 input group "=== Exit ==="
 input double         MoneyPerLotTP      = 10.0;     // basket TP = TotalLots * this (account currency)
@@ -731,8 +743,13 @@ int CloseAllPositions()
    return closed;
   }
 
-//--- NormalizeLot : rounds a volume down to the broker step and enforces caps.
+//--- NormalizeLot : rounds a volume to the broker step and enforces caps.
 //--- raw : requested volume.  capLimit : extra ceiling (e.g. remaining lot budget).
+//--- Rounding is controlled by LotRoundingMode:
+//---   LOT_ROUND_FLOOR   -> round DOWN to step (never overshoots caps).
+//---   LOT_ROUND_NEAREST -> round to NEAREST step (matches the multiplier ladder).
+//--- When rounding up would exceed the cap, the cap is re-floored to the step so
+//--- the returned volume is always a legal broker volume.
 //--- Returns: normalized volume, or 0.0 when the request cannot be honored.
 double NormalizeLot(const double raw, const double capLimit)
   {
@@ -741,16 +758,35 @@ double NormalizeLot(const double raw, const double capLimit)
    double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    if(volStep <= 0.0 || volMin <= 0.0 || volMax <= 0.0)
       return 0.0;
+
+   // Build the effective cap: broker max, MaxLotSize, and the caller's headroom.
    double cap = MathMin(MaxLotSize, volMax);
    if(capLimit > 0.0)
       cap = MathMin(cap, capLimit);
    if(cap < volMin)
       return 0.0;                       // no room for even the smallest lot
-   double lot = MathFloor(raw / volStep + LOT_TOLERANCE) * volStep;   // round DOWN to step
+
+   // Round to the broker step according to the selected mode.
+   double lot;
+   if(LotRoundingMode == LOT_ROUND_NEAREST)
+      lot = MathRound(raw / volStep) * volStep;
+   else
+      lot = MathFloor(raw / volStep + LOT_TOLERANCE) * volStep;
+
    if(lot < volMin)
       lot = volMin;
+
+   // Clamp to the cap. With nearest rounding, the cap itself must be re-floored
+   // to the step so we never return a non-step-multiple volume.
    if(lot > cap)
-      lot = cap;
+     {
+      lot = (LotRoundingMode == LOT_ROUND_NEAREST)
+            ? MathFloor(cap / volStep + LOT_TOLERANCE) * volStep
+            : cap;
+      if(lot < volMin)
+         return 0.0;
+     }
+
    lot = NormalizeDouble(lot, LOT_DECIMALS);
    if(lot < volMin || lot > volMax)
       return 0.0;
