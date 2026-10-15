@@ -24,14 +24,18 @@
 //|   6. Re-arm delay (StraddleRearmDelayBars) is applied after a     |
 //|      basket close, after pending expiry and after stray-pending   |
 //|      cleanup, to avoid re-arm churn inside the same bar.          |
-//|   7. Server-side basket TP (UseServerSideBasketTP) mirrors the code-driven
-//|      money target onto every open order at a safety-factor-multiplied price.
-//|      Purpose: if the EA stops running, the broker still closes the basket.
-//|      It is deliberately NOT cleaned up on deinit. Disabled on dirty grids.
+//|   7. Server-side basket TP (UseServerSideBasketTP) mirrors the basket    |
+//|      money target onto every open order as a TP at the computed price.   |
+//|      When enabled the BROKER owns the exit: ManageExits() returns early  |
+//|      so the code-driven money close cannot race the server TP, and the   |
+//|      code-driven exit path (incl. UsePartialClose) only runs when the    |
+//|      feature is off. Single deterministic exit price; the basket still   |
+//|      closes if the EA stops running. Deliberately NOT cleaned up on     |
+//|      deinit, and disabled on dirty grids.                               |
 //+------------------------------------------------------------------+
 #property copyright "Omega X"
 #property link      ""
-#property version   "1.00"
+#property version   "1.10"
 #property description "One-sided grid martingale with straddle entry, dynamic basket TP and a safety layer. Hedging only."
 
 #include <Trade\Trade.mqh>
@@ -113,7 +117,7 @@ input double         TPDecayFactor      = 0.95;     // applied as factor^(levels
 input bool           UsePartialClose    = false;    // close oldest profitable trade at X% of target
 input double         PartialCloseRatio  = 0.8;      // 0..1
 input bool           UseServerSideBasketTP = true;   // Place computed TP on all basket orders (crash safety net)
-input double         BasketTPSafetyFactor  = 1.10;   // Server TP is this multiple of the code target (>= 1.0)
+input double         BasketTPSafetyFactor  = 1.0;   // Server TP is this multiple of the code target (>= 1.0)
 
 input group "=== Safety Layer ==="
 input double         MaxTotalLots       = 5.0;      // hard cap on summed grid lots
@@ -1252,9 +1256,10 @@ int ClearBasketTP()
    return cleared;
   }
 
-//--- ManageExits : dynamic basket TP and optional partial close.
-//--- NOTE: floating PL = POSITION_PROFIT + POSITION_SWAP. Commission is deliberately
-//--- excluded (most brokers report it separately); adjust MoneyPerLotTP if needed.
+//--- ManageExits : with server-side TP active, the broker owns the exit.
+//--- The code-driven money-based close is disabled so the two cannot race:
+//--- the server TP alone decides when the basket is closed (deterministic price).
+//--- When UseServerSideBasketTP is false, the original code-driven close is used.
 //--- Returns: void.
 void ManageExits()
   {
@@ -1262,6 +1267,13 @@ void ManageExits()
    if(count <= 0)
       return;
 
+   // When the server-side TP is enabled, exit management is delegated to the broker.
+   // ApplyBasketTP() (called from ManageInGrid) keeps the TP price in sync with the
+   // live basket. Do not issue a second, code-driven close here.
+   if(UseServerSideBasketTP)
+      return;
+
+   // ---- Original code-driven exit path (used only when server-side TP is off) ----
    double totalLots = 0.0;
    double floatingPL = 0.0;
    for(int i = 0; i < count; i++)
@@ -1274,7 +1286,6 @@ void ManageExits()
    if(!(totalLots > 0.0))
       return;
 
-   // Basket TP is a money target and is recomputed on every tick.
    double target = totalLots * MoneyPerLotTP;
    if(UseTPDecay)
       target *= MathPow(TPDecayFactor, (double)count - 1.0);
@@ -1292,12 +1303,7 @@ void ManageExits()
          if(ClosePositionTicket(ticket))
            {
             g_lastCloseBar = CurrentBarTime();
-            if(UseServerSideBasketTP)
-              {
-               RebuildGrid();       // remaining orders must mirror the NEW basket composition
-               ApplyBasketTP();
-              }
-            return;               // basket continues with the remaining levels
+            return;
            }
         }
      }
@@ -1307,7 +1313,7 @@ void ManageExits()
       int closed = CloseAllPositions();
       LogInfo(StringFormat("[GM] Basket closed. Levels: %d, Lots: %.2f, PL: %.2f (target %.2f, closed %d positions).",
                            count, totalLots, floatingPL, target, closed));
-      g_lastCloseBar = CurrentBarTime();   // re-arm gating
+      g_lastCloseBar = CurrentBarTime();
      }
   }
 
