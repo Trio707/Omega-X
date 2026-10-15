@@ -32,6 +32,12 @@
 //|      feature is off. Single deterministic exit price; the basket still   |
 //|      closes if the EA stops running. Deliberately NOT cleaned up on     |
 //|      deinit, and disabled on dirty grids.                               |
+//|   8. On a DIRTY grid (positions on both sides) with UseServerSideBasketTP |
+//|      enabled the basket has NO exit at all: ClearBasketTP() strips the    |
+//|      server TP and ManageExits() returns early, so only the equity/       |
+//|      daily-loss halt can close it. WarnDirtyGridExitless() therefore logs |
+//|      this through LogError (once per bar, independent of VerboseLog) so a |
+//|      hedged or gap-through basket can never sit unnoticed.                |
 //+------------------------------------------------------------------+
 #property copyright "Omega X"
 #property link      ""
@@ -173,6 +179,7 @@ ulong    g_sellStopTicket       = 0;              // live SellStop ticket of the
 ENUM_STRADDLE_STATE g_state     = STATE_IDLE;     // last processed state (transition logging only)
 datetime g_lastCloseBar         = 0;              // bar time of the last basket close / cancel
 datetime g_lastSkipBar          = 0;              // bar time of the last throttled "skip" log
+datetime g_lastDirtyWarnBar     = 0;              // bar time of the last "dirty grid has no exit" warning
 
 //+------------------------------------------------------------------+
 //|  Small formatting / logging helpers                               |
@@ -1317,6 +1324,28 @@ void ManageExits()
      }
   }
 
+//--- WarnDirtyGridExitless : reports that a dirty basket currently has NO exit path.
+//--- With UseServerSideBasketTP enabled the server TP is stripped on dirty grids and
+//--- ManageExits() returns early, so neither a server TP nor the code-driven close can
+//--- close the basket; only the equity/daily-loss halt remains. Emitted through LogError
+//--- (always printed, even with VerboseLog off) but throttled to once per bar so a
+//--- long-lived dirty grid cannot flood the journal.
+//--- Returns: void.
+void WarnDirtyGridExitless()
+  {
+   if(!UseServerSideBasketTP)
+      return;
+   datetime bar = CurrentBarTime();
+   if(bar == g_lastDirtyWarnBar)
+      return;
+   g_lastDirtyWarnBar = bar;
+   LogError(StringFormat("DIRTY GRID HAS NO EXIT: %d positions open on BOTH sides. The server-side TP "
+                         "was cleared and the code-driven exit is disabled, so nothing can close this "
+                         "basket until it is flat again. Only the equity/daily-loss halt can act. "
+                         "Close the basket manually or set UseServerSideBasketTP=false.",
+                         ArraySize(g_grid)));
+  }
+
 //--- ManageInGrid : grid management while a basket is open.
 //--- Returns: void.
 void ManageInGrid()
@@ -1326,9 +1355,15 @@ void ManageInGrid()
    if(UseServerSideBasketTP)
      {
       if(g_gridDirty)
+        {
          ClearBasketTP();
+         WarnDirtyGridExitless();       // dirty basket is left without any exit
+        }
       else
+        {
          ApplyBasketTP();
+         g_lastDirtyWarnBar = 0;        // allow an immediate warning if it goes dirty again
+        }
      }
 
    ManageGridAdds();

@@ -36,7 +36,7 @@ A MetaTrader 5 Expert Advisor implementing a **one-sided grid martingale** with 
 | Magic number | `892174` (hard-coded) |
 | Strategy | One-sided grid martingale |
 | Entry | Straddle of BuyStop + SellStop pendings |
-| Exit | Money-based basket TP (code-driven) + optional server-side TP |
+| Exit | Broker-side basket TP **or** code-driven money TP — mutually exclusive, see below |
 | Safety | Equity stop, daily loss stop, spread filter, session/news filter, lot caps |
 | Timeframe | Any (indicator periods are user-set) |
 | Symbol | Any (tested on FX and XAUUSD) |
@@ -77,15 +77,24 @@ Lot sizes follow `BaseLot × LotMultiplier^(n-1)`, capped by `MaxLotSize` and by
 
 ### 3. Exit (basket TP)
 
-The EA never sets a TP on individual orders. Every tick it recomputes:
+Every tick the EA recomputes the same money target:
 
 ```
 target = totalLots × MoneyPerLotTP   (× TPDecayFactor^(levels-1) if UseTPDecay)
 ```
 
-When the basket's floating P/L (profit + swap) reaches `target`, **all positions are closed at once**.
+**How that target is realised depends on `UseServerSideBasketTP`** — the two mechanisms are mutually exclusive, not additive:
 
-Optional partial close: when floating P/L reaches `PartialCloseRatio × target`, the **oldest profitable position** is closed and the basket continues.
+| `UseServerSideBasketTP` | Who closes the basket |
+|---|---|
+| `true` (default) | The **broker**, via a TP placed on every open order at the computed price. `ManageExits()` returns early, so the code-driven close never runs. |
+| `false` | The **EA**, on the very tick the basket's floating P/L (profit + swap) reaches `target` — all positions closed at once. |
+
+Consequences of leaving the default `true`:
+
+- The exit is a **single deterministic price** rather than a floating-P/L threshold, so it cannot be missed by a slow tick or a slippage spike.
+- The code-driven exit path is inactive, which also means `UsePartialClose` / `PartialCloseRatio` have **no effect**. Set `UseServerSideBasketTP = false` if you need partial closes.
+- See [Server-side basket TP](#server-side-basket-tp) for the price computation and the dirty-grid caveat.
 
 ### 4. Safety layer
 
@@ -105,16 +114,32 @@ Once halted (`g_halted = true`), the EA closes everything and stops arming or ad
 
 ## Server-side basket TP
 
-In addition to the code-driven basket exit, the EA can mirror the money target onto every open order as a **server-side TP**. This is a crash-safety net: if the EA stops running (VPS dies, terminal crashes, internet drops), the broker will still close the basket on its own.
+The EA can mirror the money target onto every open order as a **server-side TP**, so the **broker** owns the exit. While this mode is active the code-driven close is disabled, which means the exit survives a dead EA: if it stops running (VPS dies, terminal crashes, internet drops), the broker still closes the basket on its own.
 
 - Controlled by `UseServerSideBasketTP` (default `true`).
-- The placed TP price is `BasketTPSafetyFactor` × the code-driven target (default `1.10` = 10% further out), so under normal conditions the code-driven exit fires **first** at the cheaper price.
+- The placed TP price is `BasketTPSafetyFactor` × the money target. The default is `1.0`, i.e. the TP sits **exactly** on the target price. Note that the price is rounded to the symbol's digits, so for a BUY basket the rounded TP may land marginally *nearer* than the exact target and realize slightly under it. Raise the factor (e.g. `1.05`) if you want a cushion against that rounding.
 - Computed from the volume-weighted average entry of all open positions.
-- **Disabled on dirty grids** (mixed BUY + SELL) — no single price can express the basket target.
-- **Recomputed every tick** so new levels, partial closes, and dirty transitions are handled automatically.
+- **Recomputed every tick**, so new grid levels and dirty transitions are handled automatically.
+- **Idempotent**: orders whose TP already matches (within half a point) are not re-modified, so a no-op tick issues no requests.
 - **Not cleaned up on deinit** — the whole point is that the TP survives the EA's removal.
+- Setting `UseServerSideBasketTP = false` restores the code-driven money close and disables all of the above.
 
-To compute the TP, the EA uses `SYMBOL_TRADE_TICK_VALUE` and `SYMBOL_TRADE_TICK_SIZE` to convert the money target into a price distance. If either is unavailable or invalid, the server TP is skipped for that tick and retried later.
+To compute the TP, the EA uses `SYMBOL_TRADE_TICK_VALUE` and `SYMBOL_TRADE_TICK_SIZE` to convert the money target into a price distance. If either is unavailable or invalid, the server TP is skipped for that tick and retried later. If the computed price would fall inside the broker's `SYMBOL_TRADE_STOPS_LEVEL` / `SYMBOL_TRADE_FREEZE_LEVEL` distance, the EA **does not** move the TP closer to the market — it simply skips the tick and retries later, so the net never weakens the exit.
+
+### ⚠️ Dirty grids have no exit
+
+A **dirty grid** is one with positions on **both** the BUY and SELL side (this can happen via the straddle gap-through case, or if a hedge is placed manually). No single price can express the basket money target, so:
+
+- `ClearBasketTP()` **strips** the server TP from every order, and
+- `ManageExits()` returns early, so the code-driven close never runs.
+
+The result is a basket that **nothing can close** except the `EquityStopPercent` / `DailyLossPercent` halts. The EA therefore emits a loud warning through `LogError` — printed regardless of `VerboseLog`, at most once per bar:
+
+```
+[GM] ERROR ... | DIRTY GRID HAS NO EXIT: 2 positions open on BOTH sides. The server-side TP was cleared ...
+```
+
+**Watch for that line.** Either close such a basket manually, or set `UseServerSideBasketTP = false` so the code-driven exit handles it again.
 
 ---
 
@@ -170,10 +195,10 @@ On first attach, the EA inspects live positions and pending orders and **recover
 | `MoneyPerLotTP` | 10.0 | Basket TP = TotalLots × this |
 | `UseTPDecay` | false | Shrink TP with depth |
 | `TPDecayFactor` | 0.95 | Applied as factor^(levels-1) |
-| `UsePartialClose` | false | Close oldest profitable trade at X% of target |
+| `UsePartialClose` | false | Close oldest profitable trade at X% of target — **ignored while `UseServerSideBasketTP` is true** |
 | `PartialCloseRatio` | 0.8 | 0..1 |
-| `UseServerSideBasketTP` | true | Place computed TP on all basket orders |
-| `BasketTPSafetyFactor` | 1.10 | Server TP is this multiple of the code target (≥ 1.0) |
+| `UseServerSideBasketTP` | true | Let the **broker** own the exit via a TP on every order; disables the code-driven close |
+| `BasketTPSafetyFactor` | 1.0 | Server TP is this multiple of the money target (≥ 1.0, enforced at init) |
 
 ### Safety Layer
 
@@ -261,10 +286,13 @@ Examples:
 [GM] 2026.01.15 15:01:08 | Basket closed. Levels: 3, Lots: 0.08, PL: 0.83 (target 0.80, closed 3 positions).
 ```
 
-Halt triggers are prefixed with `ERROR` and always printed, e.g.:
+The last line is only produced when `UseServerSideBasketTP = false`; with the default `true` the broker closes the basket at the TP price and no such line appears.
+
+Errors are prefixed with `ERROR` and always printed, regardless of `VerboseLog`:
 
 ```
 [GM] ERROR 2026.01.15 15:22:44 | HALT TRIGGERED: Equity stop: equity 34950.12 <= 35000.00 (30.0% of 50000.00). ...
+[GM] ERROR 2026.01.15 15:40:02 | DIRTY GRID HAS NO EXIT: 2 positions open on BOTH sides. The server-side TP was cleared ...
 ```
 
 ---
@@ -273,10 +301,11 @@ Halt triggers are prefixed with `ERROR` and always printed, e.g.:
 
 1. **Martingale blowup risk.** Even with all safety nets active, a strong sustained trend can produce large drawdowns. The safety layer reduces — but does not eliminate — this risk.
 2. **Frozen ATR after restart.** ATR-spacing grids cannot recover the fill-time ATR. They use the current ATR as a fallback.
-3. **Server-side TP is skipped on dirty grids.** When both sides are open, no single price expresses the basket target, and the code-driven exit is the only exit.
+3. **A dirty grid has no exit while the server-side TP is enabled.** With `UseServerSideBasketTP = true` (the default) and positions open on **both** sides, the server TP is stripped and the code-driven close is disabled — so only the `EquityStopPercent` / `DailyLossPercent` halts can close the basket. The EA logs a `DIRTY GRID HAS NO EXIT` error (once per bar, always printed) to make this impossible to miss, but it is still a state you must monitor. Set `UseServerSideBasketTP = false` to restore a code-driven exit for such baskets.
 4. **No per-trade SL.** Positions rely entirely on the basket-level safety layer.
 5. **Grid adds can fail under margin pressure.** If the broker rejects a grid add, the EA logs the error. See "Retry behavior" below.
 6. **Symbol-dependent tick values.** On some brokers, `SYMBOL_TRADE_TICK_VALUE` semantics differ. If the server-side TP price ever looks wrong, inspect this first.
+7. **`BasketTPSafetyFactor = 1.0` leaves no rounding cushion.** The TP price is rounded to the symbol's digits; for a BUY basket that can place the TP marginally nearer than the exact target, so the realized profit can come in just under `totalLots × MoneyPerLotTP`. Raise the factor if that matters.
 
 ### Retry behavior
 
@@ -292,7 +321,8 @@ Halt triggers are prefixed with `ERROR` and always printed, e.g.:
 4. **Session/news filters gate arming only.** Once a grid is committed, only the spread filter and halts can block new grid levels.
 5. **`MaxTotalLots` enforcement.** The next lot is capped to the free headroom. If headroom is below the broker volume minimum, the level is skipped and logged.
 6. **Re-arm delay.** `StraddleRearmDelayBars` is applied after a basket close, after pending expiry, and after stray-pending cleanup, to avoid churn within the same bar.
-7. **Server-side basket TP.** Mirrors the code-driven money target onto every open order at a safety-factor-multiplied price. Purpose: if the EA stops running, the broker still closes the basket. Deliberately **not** cleaned up on deinit. Disabled on dirty grids.
+7. **Server-side basket TP owns the exit.** The money target is mirrored onto every open order as a TP at `BasketTPSafetyFactor` × the target price, anchored on the volume-weighted average entry. While this mode is enabled `ManageExits()` returns early, so the code-driven close cannot race the server TP and `UsePartialClose` is inert. One deterministic exit price, and the basket still closes if the EA stops running. Deliberately **not** cleaned up on deinit, and disabled on dirty grids.
+8. **Dirty grids are reported loudly.** On a dirty grid (positions on both sides) the server TP is stripped and the code-driven exit is disabled, leaving only the equity/daily-loss halts. `WarnDirtyGridExitless()` emits this via `LogError` — always printed, throttled to once per bar — so a gap-through or manually hedged basket cannot sit unnoticed.
 
 ---
 
@@ -302,7 +332,7 @@ Halt triggers are prefixed with `ERROR` and always printed, e.g.:
 |---|---|
 | Filename | `Omega_X_EA.mq5` |
 | Author | Omega X |
-| Version | 1.00 |
+| Version | 1.10 |
 | Magic number | `892174` |
 | Platform | MetaTrader 5 |
 | Account type | Hedging only |
