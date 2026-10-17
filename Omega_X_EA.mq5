@@ -1854,6 +1854,11 @@ void OnTick()
 
    if(g_state != STATE_IDLE)
      {
+      if(g_state == STATE_IN_GRID)
+        {
+         g_lastCloseBar = CurrentBarTime();
+         LogInfo("[GM] Transition IN_GRID -> IDLE detected: stamping re-arm delay.");
+        }
       LogTransition(g_state, state);
       g_state = state;
      }
