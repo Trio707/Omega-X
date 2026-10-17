@@ -15,9 +15,10 @@
 //|   3. The ATR snapshot for SPACING_ATR is frozen at level-1 fill.  |
 //|      After a restart the fill-time ATR is unrecoverable, so the   |
 //|      live completed-bar ATR is used as a documented fallback.     |
-//|   4. Session/news filters gate STRADDLE ARMING only. Once a grid  |
-//|      is committed only the spread filter and halts can block new  |
-//|      grid levels.                                                 |
+//|   4. Session filters gate STRADDLE ARMING only. Blackout windows  |
+//|      (incl. the pre-blackout buffer) gate arming AND new grid     |
+//|      levels. Once a grid is committed only the spread filter,     |
+//|      blackouts and halts can block new grid levels.               |
 //|   5. MaxTotalLots is enforced by capping the next lot to the free |
 //|      headroom; if headroom < broker volume minimum the level is    |
 //|      skipped and logged.                                          |
@@ -43,10 +44,21 @@
 //|        LOT_ROUND_NEAREST -> MathRound to broker step, with the cap re-floored
 //|                             to the step so the result stays a legal volume.
 //|      Only the body of NormalizeLot changes; callers are unaffected.       |
+//|  10. Blackout windows replace the news string filter: three       |
+//|      daily toggleable windows sharing one pre-blackout buffer.    |
+//|      Windows wrap past midnight when end <= start; times are      |
+//|      broker server time. Only NEW trades (straddle arming, grid   |
+//|      adds) are blocked; open positions are left to their TPs.     |
+//|  11. The profit-money cap is reactive: realized balance vs the    |
+//|      balance at EA start latches the halt (survives the day roll) |
+//|      and flattens the book; an EA restart re-baselines it.        |
+//|  12. DecisionTimeframe drives ALL decision data (range, ATR, bar  |
+//|      timing, re-arm delay); the chart timeframe is a display      |
+//|      detail only.                                                 |
 //+------------------------------------------------------------------+
 #property copyright "Omega X"
 #property link      ""
-#property version   "1.10"
+#property version   "1.11"
 #property description "One-sided grid martingale with straddle entry, dynamic basket TP and a safety layer. Hedging only."
 
 #include <Trade\Trade.mqh>
@@ -91,6 +103,7 @@ const double         POINTS_PER_PIP        = 10.0;     // spec convention: 1 pip
 const double         PERCENT_UNIT          = 100.0;
 const int            SECONDS_PER_HOUR      = 3600;
 const int            SECONDS_PER_DAY       = 86400;
+const int            MINUTES_PER_DAY       = 1440;
 const int            BARS_OUTSIDE_HISTORY  = 1000000;  // sentinel when a bar cannot be located
 const int            MIN_LOOKBACK_BARS     = 1;
 const int            MIN_GRID_LEVELS       = 1;
@@ -113,6 +126,9 @@ struct GridLevel
 //+------------------------------------------------------------------+
 //|  Input parameters                                                 |
 //+------------------------------------------------------------------+
+input group "=== General Settings ==="
+input ENUM_TIMEFRAMES DecisionTimeframe   = PERIOD_CURRENT; // timeframe for all EA decisions (data, bars, ATR)
+
 input group "=== Grid Spacing ==="
 input ENUM_SPACING_MODE SpacingMode     = SPACING_FIXED;
 input double         GridStepPoints     = 300;      // FIXED: distance between levels in points
@@ -136,17 +152,35 @@ input bool           UsePartialClose    = false;    // close oldest profitable t
 input double         PartialCloseRatio  = 0.8;      // 0..1
 input bool           UseServerSideBasketTP = true;   // Place computed TP on all basket orders (crash safety net)
 input double         BasketTPSafetyFactor  = 1.0;   // Server TP is this multiple of the code target (>= 1.0)
+input bool           UseProfitMoneyCap  = false;    // halt the EA once realized balance grew by the cap
+input double         ProfitMoneyCap     = 100.0;    // account-currency growth from the balance at EA start
 
 input group "=== Safety Layer ==="
 input double         MaxTotalLots       = 5.0;      // hard cap on summed grid lots
 input double         EquityStopPercent  = 30.0;     // close all + halt if equity drops this % from start of day
 input double         DailyLossPercent   = 10.0;     // close all + pause until next server day
 input int            MaxSpreadPoints    = 50;       // do not arm / add above this spread
-input bool           UseNewsFilter      = false;    // local time-window filter (no external calls)
-input string         NewsBlackoutWindows = "";      // e.g. "2026.01.15 14:30-15:30;2026.02.02 10:00-10:45"
 input bool           UseSessionFilter   = false;
 input int            SessionStartHour   = 0;        // server time, inclusive
 input int            SessionEndHour     = 24;       // server time, exclusive
+
+input group "=== Session Blackouts ==="
+input int            PreBlackoutBufferMinutes = 30;  // stop new trades this many minutes before a blackout
+input bool           UseBlackout1       = false;
+input int            Blackout1StartHour = 23;        // 0..23 server time
+input int            Blackout1StartMin  = 0;         // 0..59
+input int            Blackout1EndHour   = 2;         // 0..23 server time
+input int            Blackout1EndMin    = 0;         // 0..59
+input bool           UseBlackout2       = false;
+input int            Blackout2StartHour = 0;         // 0..23 server time
+input int            Blackout2StartMin  = 0;         // 0..59
+input int            Blackout2EndHour   = 0;         // 0..23 server time
+input int            Blackout2EndMin    = 0;         // 0..59
+input bool           UseBlackout3       = false;
+input int            Blackout3StartHour = 0;         // 0..23 server time
+input int            Blackout3StartMin  = 0;         // 0..59
+input int            Blackout3EndHour   = 0;         // 0..23 server time
+input int            Blackout3EndMin    = 0;         // 0..59
 
 input group "=== Execution ==="
 input int            SlippagePoints     = 20;
@@ -180,6 +214,8 @@ int      g_handleRangeATR       = INVALID_HANDLE;  // ATR for range validity fil
 bool     g_halted               = false;          // equity stop / daily loss halt
 string   g_haltReason           = "";
 double   g_startOfDayEquity     = 0.0;            // equity snapshot at server day start
+double   g_startingBalance      = 0.0;            // balance snapshot at EA start (profit-cap reference)
+bool     g_profitCapLatched     = false;          // profit-cap halt survives day rolls (permanent latch)
 int      g_serverDayIndex       = 0;              // broker server day marker
 double   g_gridATR              = 0.0;            // ATR frozen at level-1 fill
 bool     g_gridATRSet           = false;
@@ -260,7 +296,7 @@ void LogSkip(const string msg)
   {
    if(!VerboseLog)
       return;
-   datetime bar = iTime(_Symbol, PERIOD_CURRENT, 0);
+   datetime bar = iTime(_Symbol, DecisionTimeframe, 0);
    if(bar == g_lastSkipBar)
       return;
    g_lastSkipBar = bar;
@@ -302,11 +338,11 @@ int ServerDayIndex()
    return (int)((long)ServerTimeNow() / SECONDS_PER_DAY);
   }
 
-//--- CurrentBarTime : open time of the current chart bar.
+//--- CurrentBarTime : open time of the current DecisionTimeframe bar.
 //--- Returns: bar open time (0 on failure).
 datetime CurrentBarTime()
   {
-   return iTime(_Symbol, PERIOD_CURRENT, 0);
+   return iTime(_Symbol, DecisionTimeframe, 0);
   }
 
 //--- BarsSinceTime : number of bars elapsed since a given moment.
@@ -316,7 +352,7 @@ int BarsSinceTime(const datetime t)
   {
    if(t <= 0)
       return BARS_OUTSIDE_HISTORY;
-   int idx = iBarShift(_Symbol, PERIOD_CURRENT, t, false);
+   int idx = iBarShift(_Symbol, DecisionTimeframe, t, false);
    if(idx < 0)
       return BARS_OUTSIDE_HISTORY;
    return idx;
@@ -417,6 +453,16 @@ bool ValidateInputs()
       if(SessionStartHour >= SessionEndHour)
          return FailInit("SessionStartHour must be smaller than SessionEndHour.");
      }
+   if(UseProfitMoneyCap && !(ProfitMoneyCap > 0.0))
+      return FailInit("ProfitMoneyCap must be > 0 when UseProfitMoneyCap is enabled.");
+   if(PreBlackoutBufferMinutes < 0)
+      return FailInit("PreBlackoutBufferMinutes must be >= 0.");
+   if(UseBlackout1 && !BlackoutBoundsOk(Blackout1StartHour, Blackout1StartMin, Blackout1EndHour, Blackout1EndMin))
+      return FailInit("Blackout1 hour/minute fields are out of range (hours 0..23, minutes 0..59).");
+   if(UseBlackout2 && !BlackoutBoundsOk(Blackout2StartHour, Blackout2StartMin, Blackout2EndHour, Blackout2EndMin))
+      return FailInit("Blackout2 hour/minute fields are out of range (hours 0..23, minutes 0..59).");
+   if(UseBlackout3 && !BlackoutBoundsOk(Blackout3StartHour, Blackout3StartMin, Blackout3EndHour, Blackout3EndMin))
+      return FailInit("Blackout3 hour/minute fields are out of range (hours 0..23, minutes 0..59).");
    return true;
   }
 
@@ -886,47 +932,107 @@ bool InSession()
    return (hour >= SessionStartHour && hour < SessionEndHour);
   }
 
-//--- InNewsBlackout : true when "now" falls inside a configured blackout window.
-//--- Windows are "YYYY.MM.DD HH:MM-HH:MM" separated by ';'. When the end time is
-//--- not after the start time the window is treated as spilling into the next day.
-//--- Times are compared against TimeCurrent(), the same basis used by StringToTime.
-//--- Returns: bool.
-bool InNewsBlackout()
+//--- MinuteOfDay : current broker server time as minutes since midnight.
+//--- Returns: 0..1439, or -1 when the server clock cannot be read.
+int MinuteOfDay()
   {
-   if(!UseNewsFilter)
+   MqlDateTime dt;
+   if(!TimeToStruct(ServerTimeNow(), dt))
+      return -1;
+   return dt.hour * 60 + dt.min;
+  }
+
+//--- BlackoutBoundsOk : true when the four clock fields of a blackout are within range.
+//--- startHour/endHour : hours, must be 0..23.  startMin/endMin : minutes, must be 0..59.
+//--- Returns: bool.
+bool BlackoutBoundsOk(const int startHour, const int startMin, const int endHour, const int endMin)
+  {
+   if(startHour < 0 || startHour > 23 || endHour < 0 || endHour > 23)
       return false;
-   if(StringLen(NewsBlackoutWindows) == 0)
+   if(startMin < 0 || startMin > 59 || endMin < 0 || endMin > 59)
       return false;
-   datetime now = TimeCurrent();
-   string items[];
-   int count = StringSplit(NewsBlackoutWindows, ';', items);
-   if(count <= 0)
+   return true;
+  }
+
+//--- BlackoutWindowActive : true when a minute-of-day falls inside a daily window.
+//--- Windows wrap past midnight when end <= start (equal bounds = whole day).
+//--- nowMinutes : minutes since midnight.  startHour/startMin : window start.
+//--- endHour/endMin : window end. Returns: bool.
+bool BlackoutWindowActive(const int nowMinutes, const int startHour, const int startMin,
+                          const int endHour, const int endMin)
+  {
+   int start = startHour * 60 + startMin;
+   int end   = endHour * 60 + endMin;
+   if(end <= start)                  // spills past midnight
+      return (nowMinutes >= start || nowMinutes < end);
+   return (nowMinutes >= start && nowMinutes < end);
+  }
+
+//--- InAnyBlackout : true when "now" is inside any enabled blackout window.
+//--- Windows recur daily in broker server time; midnight wraps are handled.
+//--- Fails closed (returns true) when the server clock cannot be read.
+//--- Returns: bool.
+bool InAnyBlackout()
+  {
+   if(!UseBlackout1 && !UseBlackout2 && !UseBlackout3)
       return false;
-   for(int i = 0; i < count; i++)
+   int now = MinuteOfDay();
+   if(now < 0)
+      return true;
+   if(UseBlackout1 && BlackoutWindowActive(now, Blackout1StartHour, Blackout1StartMin,
+                                           Blackout1EndHour, Blackout1EndMin))
+      return true;
+   if(UseBlackout2 && BlackoutWindowActive(now, Blackout2StartHour, Blackout2StartMin,
+                                           Blackout2EndHour, Blackout2EndMin))
+      return true;
+   if(UseBlackout3 && BlackoutWindowActive(now, Blackout3StartHour, Blackout3StartMin,
+                                           Blackout3EndHour, Blackout3EndMin))
+      return true;
+   return false;
+  }
+
+//--- InPreBlackoutBuffer : true when "now" is within PreBlackoutBufferMinutes BEFORE
+//--- the start of any enabled blackout window. Midnight rollovers are handled by the
+//--- modulo arithmetic (the lead is measured forward around the 24h clock).
+//--- Fails closed (returns true) when the server clock cannot be read.
+//--- Returns: bool.
+bool InPreBlackoutBuffer()
+  {
+   if(PreBlackoutBufferMinutes <= 0)
+      return false;
+   if(!UseBlackout1 && !UseBlackout2 && !UseBlackout3)
+      return false;
+   int now = MinuteOfDay();
+   if(now < 0)
+      return true;
+   if(UseBlackout1)
      {
-      string window = items[i];
-      StringTrimLeft(window);
-      StringTrimRight(window);
-      if(StringLen(window) == 0)
-         continue;
-      int spacePos = StringFind(window, " ");
-      if(spacePos <= 0)
-         continue;
-      string datePart = StringSubstr(window, 0, spacePos);
-      string timePart = StringSubstr(window, spacePos + 1);
-      int dashPos = StringFind(timePart, "-");
-      if(dashPos <= 0)
-         continue;
-      datetime start = StringToTime(datePart + " " + StringSubstr(timePart, 0, dashPos));
-      datetime end   = StringToTime(datePart + " " + StringSubstr(timePart, dashPos + 1));
-      if(start == 0 || end == 0)
-         continue;
-      if(end <= start)
-         end += SECONDS_PER_DAY;
-      if(now >= start && now <= end)
+      int lead = (Blackout1StartHour * 60 + Blackout1StartMin - now + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+      if(lead > 0 && lead <= PreBlackoutBufferMinutes)
+         return true;
+     }
+   if(UseBlackout2)
+     {
+      int lead = (Blackout2StartHour * 60 + Blackout2StartMin - now + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+      if(lead > 0 && lead <= PreBlackoutBufferMinutes)
+         return true;
+     }
+   if(UseBlackout3)
+     {
+      int lead = (Blackout3StartHour * 60 + Blackout3StartMin - now + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+      if(lead > 0 && lead <= PreBlackoutBufferMinutes)
          return true;
      }
    return false;
+  }
+
+//--- IsTradingBlockedByBlackout : true when NEW trades must not be opened (inside a
+//--- blackout window or within the pre-blackout buffer). Existing positions are never
+//--- touched by this gate; they are left to their TPs and the halt layer.
+//--- Returns: bool.
+bool IsTradingBlockedByBlackout()
+  {
+   return (InAnyBlackout() || InPreBlackoutBuffer());
   }
 
 //+------------------------------------------------------------------+
@@ -941,6 +1047,12 @@ void CheckNewDayRoll()
       return;
    g_serverDayIndex = day;
    g_startOfDayEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(g_profitCapLatched)
+     {
+      LogInfo(StringFormat("[GM] New server day: startOfDayEquity reset to %.2f. Profit-cap halt stays latched.",
+                           g_startOfDayEquity));
+      return;
+     }
    bool wasHalted = g_halted;
    g_halted = false;
    g_haltReason = "";
@@ -985,6 +1097,28 @@ bool SafetyCheck()
       return true;
      }
    return false;
+  }
+
+//--- CheckProfitCap : reactive target-balance halt (profit-money cap).
+//--- Purely reactive on REALIZED balance vs the balance captured at EA start; floating
+//--- profit is ignored and the server-side TP keeps owning the normal exits. On trigger
+//--- the basket is flattened, pendings are cancelled and the halt is latched permanently
+//--- (g_profitCapLatched keeps it through broker day rolls until the EA is restarted).
+//--- Returns: void.
+void CheckProfitCap()
+  {
+   if(!UseProfitMoneyCap || g_halted)
+      return;
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   if(balance < g_startingBalance + ProfitMoneyCap)
+      return;
+   g_profitCapLatched = true;
+   g_halted = true;
+   g_haltReason = "Profit Cap Reached (Target Balance Hit)";
+   int closed = CloseAllPositions();
+   int cancelled = CancelAllPending();
+   LogError(StringFormat("PROFIT CAP HIT: EA halted. Final Balance: %.2f (start %.2f, cap %.2f, positions closed: %d, pendings cancelled: %d).",
+                         balance, g_startingBalance, ProfitMoneyCap, closed, cancelled));
   }
 
 //+------------------------------------------------------------------+
@@ -1096,6 +1230,11 @@ void ManageGridAdds()
    if(g_halted)
      {
       LogSkip("[GM] Grid add skipped: EA is halted (" + g_haltReason + ").");
+      return;
+     }
+   if(IsTradingBlockedByBlackout())
+     {
+      LogSkip("[GM] Grid add skipped: blackout window or pre-blackout buffer active.");
       return;
      }
 
@@ -1485,9 +1624,9 @@ bool CopyRecentHighLow(const int count, double &high, double &low)
       return false;
    double highs[];
    double lows[];
-   if(CopyHigh(_Symbol, PERIOD_CURRENT, 1, count, highs) != count)
+   if(CopyHigh(_Symbol, DecisionTimeframe, 1, count, highs) != count)
       return false;
-   if(CopyLow(_Symbol, PERIOD_CURRENT, 1, count, lows) != count)
+   if(CopyLow(_Symbol, DecisionTimeframe, 1, count, lows) != count)
       return false;
    high = highs[0];
    low = lows[0];
@@ -1596,6 +1735,12 @@ bool ApplyStopLevels(double &rangeHigh, double &rangeLow)
 //--- Returns: void.
 void ManageIdle()
   {
+   if(IsTradingBlockedByBlackout())
+     {
+      LogSkip("[GM] IDLE: blackout window or pre-blackout buffer active, not arming.");
+      return;
+     }
+
    // A one-legged straddle cannot be operated: clean up before re-arming.
    if(CountPendingMagic() > 0)
      {
@@ -1623,11 +1768,6 @@ void ManageIdle()
      {
       LogSkip(StringFormat("[GM] IDLE: spread %d > MaxSpreadPoints %d, waiting.",
                            (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD), MaxSpreadPoints));
-      return;
-     }
-   if(InNewsBlackout())
-     {
-      LogSkip("[GM] IDLE: news blackout window active, waiting.");
       return;
      }
 
@@ -1766,12 +1906,19 @@ int OnInit()
       return INIT_FAILED;
      }
 
+   if(Bars(_Symbol, DecisionTimeframe) <= 100)
+     {
+      PrintFormat("[GM] INIT FAILED: not enough history on %s (need more than 100 bars).",
+                  EnumToString(DecisionTimeframe));
+      return INIT_FAILED;
+     }
+
    if(!ValidateInputs())
       return INIT_FAILED;
 
    if(SpacingMode == SPACING_ATR)
      {
-      g_handleGridATR = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+      g_handleGridATR = iATR(_Symbol, DecisionTimeframe, ATRPeriod);
       if(g_handleGridATR == INVALID_HANDLE)
         {
          PrintFormat("[GM] INIT FAILED: iATR(%d) failed, error %d.", ATRPeriod, GetLastError());
@@ -1780,7 +1927,7 @@ int OnInit()
      }
    if(UseRangeATRFilter)
      {
-      g_handleRangeATR = iATR(_Symbol, PERIOD_CURRENT, RangeATRPeriod);
+      g_handleRangeATR = iATR(_Symbol, DecisionTimeframe, RangeATRPeriod);
       if(g_handleRangeATR == INVALID_HANDLE)
         {
          PrintFormat("[GM] INIT FAILED: iATR(%d) for the range filter failed, error %d.",
@@ -1795,6 +1942,7 @@ int OnInit()
 
    g_serverDayIndex = ServerDayIndex();
    g_startOfDayEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_halted = false;
    g_haltReason = "";
 
@@ -1811,8 +1959,12 @@ int OnInit()
 //--- Returns: void.
 void OnTick()
   {
-   // 1) daily bookkeeping (broker server day roll clears halts and resets the equity baseline)
+   // 1) daily bookkeeping (broker server day roll clears halts and resets the equity
+   //    baseline; the profit-cap latch is exempt and stays latched)
    CheckNewDayRoll();
+
+   // 1b) profit-money cap: reactive realized-balance halt (stays latched through day rolls)
+   CheckProfitCap();
 
    // 2) rebuild live grid data (never cached across ticks)
    RebuildGrid();
