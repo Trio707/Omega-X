@@ -37,8 +37,8 @@ A MetaTrader 5 Expert Advisor implementing a **one-sided grid martingale** with 
 | Strategy | One-sided grid martingale |
 | Entry | Straddle of BuyStop + SellStop pendings |
 | Exit | Broker-side basket TP **or** code-driven money TP — mutually exclusive, see below |
-| Safety | Equity stop, daily loss stop, spread filter, session/news filter, lot caps |
-| Timeframe | Any (indicator periods are user-set) |
+| Safety | Equity stop, daily loss stop, profit-money cap, spread filter, session filter, blackout windows, lot caps |
+| Timeframe | `DecisionTimeframe` input (default: chart timeframe) drives all decision data — range, ATR, bar timing |
 | Symbol | Any (tested on FX and XAUUSD) |
 
 The EA does **not** use per-order stop-loss or take-profit. It manages risk and exits at the **basket level**.
@@ -105,10 +105,11 @@ Consequences of leaving the default `true`:
 | `EquityStopPercent` | Equity drop vs. start-of-day | Close all + halt until next broker day |
 | `DailyLossPercent` | Equity drop vs. start-of-day | Close all + pause until next broker day |
 | `UseSessionFilter` | Server hour outside window | Blocks **arming** only |
-| `UseNewsFilter` | Local time inside blackout | Blocks **arming** only |
+| Blackout windows (`UseBlackout1..3`) | Server time inside a window or its pre-buffer | Blocks **arming and grid adds** |
+| `UseProfitMoneyCap` | Realized balance ≥ start balance + cap | Close all + **permanent halt** (latched through day rolls) |
 | `MaxGridLevels` | Open trade count | Blocks further grid adds |
 
-Once halted (`g_halted = true`), the EA closes everything and stops arming or adding until the next broker server day.
+Once halted (`g_halted = true`), the EA closes everything and stops arming or adding until the next broker server day. The profit-money cap is the exception: it latches permanently (the halt survives day rolls — only an EA restart re-baselines it).
 
 ---
 
@@ -157,7 +158,7 @@ The result is a basket that **nothing can close** except the `EquityStopPercent`
 
 1. Copy `Omega_X_EA.mq5` into `MQL5/Experts/` in your terminal's data folder.
 2. Open **MetaEditor** and compile the file (F7).
-3. In MetaTrader 5, open a chart of your target symbol and timeframe.
+3. In MetaTrader 5, open a chart of your target symbol (the chart timeframe is a display detail — set `DecisionTimeframe` to control what the EA actually reads).
 4. Drag the EA from the Navigator onto the chart.
 5. Configure inputs (see [Input parameters](#input-parameters)).
 6. Enable **Algo Trading**.
@@ -167,6 +168,12 @@ On first attach, the EA inspects live positions and pending orders and **recover
 ---
 
 ## Input parameters
+
+### General Settings
+
+| Input | Default | Meaning |
+|---|---|---|
+| `DecisionTimeframe` | `PERIOD_CURRENT` | Timeframe used for **all** EA decisions: straddle range, ATR handles, bar timing, re-arm delay. The chart timeframe only affects display. Requires > 100 bars of history (checked at init). |
 
 ### Grid Spacing
 
@@ -199,6 +206,8 @@ On first attach, the EA inspects live positions and pending orders and **recover
 | `PartialCloseRatio` | 0.8 | 0..1 |
 | `UseServerSideBasketTP` | true | Let the **broker** own the exit via a TP on every order; disables the code-driven close |
 | `BasketTPSafetyFactor` | 1.0 | Server TP is this multiple of the money target (≥ 1.0, enforced at init) |
+| `UseProfitMoneyCap` | false | Halt the EA once **realized** balance grew by the cap (floating P/L ignored) |
+| `ProfitMoneyCap` | 100.0 | Account-currency growth from the balance at EA start (must be > 0 when enabled) |
 
 ### Safety Layer
 
@@ -208,11 +217,26 @@ On first attach, the EA inspects live positions and pending orders and **recover
 | `EquityStopPercent` | 30.0 | Close all + halt if equity drops this % from start of day |
 | `DailyLossPercent` | 10.0 | Close all + pause until next server day |
 | `MaxSpreadPoints` | 50 | Do not arm / add above this spread |
-| `UseNewsFilter` | false | Local time-window filter |
-| `NewsBlackoutWindows` | "" | e.g. `"2026.01.15 14:30-15:30;..."` |
 | `UseSessionFilter` | false | Enable session filter |
 | `SessionStartHour` | 0 | Server time, inclusive |
 | `SessionEndHour` | 24 | Server time, exclusive |
+
+### Session Blackouts
+
+Daily recurring windows in **broker server time** that block **new trades only** (straddle arming and grid adds) — open positions are never force-closed. `UseBlackout1..3` each define one window via `StartHour/StartMin/EndHour/EndMin`. A window whose end ≤ start wraps past midnight; equal start/end means a full-day blackout.
+
+| Input | Default | Meaning |
+|---|---|---|
+| `PreBlackoutBufferMinutes` | 30 | Stop new trades this many minutes **before** a blackout starts (0 disables) |
+| `UseBlackout1` | false | Enable blackout window 1 |
+| `Blackout1StartHour` / `Blackout1StartMin` | 23 / 0 | Window 1 start (hours 0..23, minutes 0..59) |
+| `Blackout1EndHour` / `Blackout1EndMin` | 2 / 0 | Window 1 end — wraps past midnight when ≤ start |
+| `UseBlackout2` | false | Enable blackout window 2 |
+| `Blackout2StartHour` / `Blackout2StartMin` | 0 / 0 | Window 2 start |
+| `Blackout2EndHour` / `Blackout2EndMin` | 0 / 0 | Window 2 end |
+| `UseBlackout3` | false | Enable blackout window 3 |
+| `Blackout3StartHour` / `Blackout3StartMin` | 0 / 0 | Window 3 start |
+| `Blackout3EndHour` / `Blackout3EndMin` | 0 / 0 | Window 3 end |
 
 ### Execution
 
@@ -293,6 +317,7 @@ Errors are prefixed with `ERROR` and always printed, regardless of `VerboseLog`:
 ```
 [GM] ERROR 2026.01.15 15:22:44 | HALT TRIGGERED: Equity stop: equity 34950.12 <= 35000.00 (30.0% of 50000.00). ...
 [GM] ERROR 2026.01.15 15:40:02 | DIRTY GRID HAS NO EXIT: 2 positions open on BOTH sides. The server-side TP was cleared ...
+[GM] ERROR 2026.01.17 09:12:31 | PROFIT CAP HIT: EA halted. Final Balance: 50100.00 (start 50000.00, cap 100.00, positions closed: 0, pendings cancelled: 2).
 ```
 
 ---
@@ -318,11 +343,14 @@ Errors are prefixed with `ERROR` and always printed, regardless of `VerboseLog`:
 1. **Straddle comment preservation.** MQL5 cannot edit `POSITION_COMMENT` after a fill, so a level-1 position keeps the straddle comment (`MG_Straddle_BuyStop`/`MG_Straddle_SellStop`). Level index falls back to open-time order.
 2. **`floatingPL = POSITION_PROFIT + POSITION_SWAP`.** Commission is excluded. Adjust `MoneyPerLotTP` if your broker charges heavy swap or commissions.
 3. **ATR snapshot frozen at level-1 fill.** After a restart, the fill-time ATR is unrecoverable; the live completed-bar ATR is used as a documented fallback.
-4. **Session/news filters gate arming only.** Once a grid is committed, only the spread filter and halts can block new grid levels.
+4. **Session filters gate arming only; blackouts gate arming and grid adds.** Once a grid is committed, the spread filter, blackout windows and halts can all block new grid levels. Blackouts never force-close open positions — they are left to their TPs and the halt layer.
 5. **`MaxTotalLots` enforcement.** The next lot is capped to the free headroom. If headroom is below the broker volume minimum, the level is skipped and logged.
 6. **Re-arm delay.** `StraddleRearmDelayBars` is applied after a basket close, after pending expiry, and after stray-pending cleanup, to avoid churn within the same bar.
 7. **Server-side basket TP owns the exit.** The money target is mirrored onto every open order as a TP at `BasketTPSafetyFactor` × the target price, anchored on the volume-weighted average entry. While this mode is enabled `ManageExits()` returns early, so the code-driven close cannot race the server TP and `UsePartialClose` is inert. One deterministic exit price, and the basket still closes if the EA stops running. Deliberately **not** cleaned up on deinit, and disabled on dirty grids.
 8. **Dirty grids are reported loudly.** On a dirty grid (positions on both sides) the server TP is stripped and the code-driven exit is disabled, leaving only the equity/daily-loss halts. `WarnDirtyGridExitless()` emits this via `LogError` — always printed, throttled to once per bar — so a gap-through or manually hedged basket cannot sit unnoticed.
+9. **Blackout windows replaced the news-string filter.** Three daily recurring windows in broker server time (`UseBlackout1..3` + start/end hour/minute), sharing one `PreBlackoutBufferMinutes` lead-in. Windows wrap past midnight when end ≤ start; equal bounds mean a full day. When the server clock cannot be read the gate **fails closed** (treated as blocked). Only new trades are blocked — TPs, halts and manual action remain the exit paths.
+10. **Profit-money cap is reactive and latched.** It compares **realized** balance against the balance captured at EA start; floating profit is ignored (the server-side TP owns normal exits). On trigger it flattens the book, cancels pendings and sets `g_profitCapLatched`, so the halt survives broker day rolls — only an EA restart re-baselines it.
+11. **`DecisionTimeframe` drives all decision data.** Range candles, both ATR handles, re-arm delay timing and bar bookkeeping all use `DecisionTimeframe`; the chart timeframe is display-only. Init fails when the decision series has ≤ 100 bars.
 
 ---
 
@@ -332,7 +360,7 @@ Errors are prefixed with `ERROR` and always printed, regardless of `VerboseLog`:
 |---|---|
 | Filename | `Omega_X_EA.mq5` |
 | Author | Omega X |
-| Version | 1.10 |
+| Version | 1.11 |
 | Magic number | `892174` |
 | Platform | MetaTrader 5 |
 | Account type | Hedging only |
